@@ -37,12 +37,37 @@ jobs:
           strip build/garlic.exe
           objdump -p build/garlic.exe | grep 'DLL Name:'
           objdump -p libs/win64/librosemarylib.dll | grep 'DLL Name:'
+          # The embedded upstream Rosemary DLL uses dynamic GCC/pthread runtimes.
+          cp /mingw64/bin/libgcc_s_seh-1.dll /mingw64/bin/libwinpthread-1.dll build/
+          mkdir -p build/runtime-licenses
+          shopt -s nullglob
+          for license in /mingw64/share/licenses/*gcc* /mingw64/share/licenses/*pthread*; do
+            cp -R "$license" build/runtime-licenses/
+          done
+          test -n "$(ls -A build/runtime-licenses)"
 
       - name: Verify on Windows without the compiler runtime in PATH
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -notmatch '(?i)msys|mingw' }) -join ';'
+          Copy-Item libs/win64/librosemarylib.dll build/rosemary-check.dll
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class NativeLibraryCheck {
+            [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags);
+            [DllImport("kernel32")]
+            public static extern bool FreeLibrary(IntPtr handle);
+          }
+          '@
+          $library = [NativeLibraryCheck]::LoadLibraryExW((Resolve-Path build/rosemary-check.dll).Path, [IntPtr]::Zero, 0x1100)
+          if ($library -eq [IntPtr]::Zero) {
+            throw "Rosemary DLL could not load: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+          }
+          [NativeLibraryCheck]::FreeLibrary($library) | Out-Null
+          Remove-Item build/rosemary-check.dll
           New-Item -ItemType Directory smoke -Force | Out-Null
           'public class Hello { public static int add(int a, int b) { return a + b; } }' | Set-Content smoke/Hello.java
           javac --release 8 smoke/Hello.java
@@ -74,6 +99,8 @@ jobs:
           New-Item -ItemType Directory "dist/$name" -Force | Out-Null
           Copy-Item build/garlic.exe, LICENSE, README.md, README.CN.md "dist/$name/"
           Copy-Item docs/garlic-on-windows.md "dist/$name/"
+          Copy-Item build/libgcc_s_seh-1.dll, build/libwinpthread-1.dll "dist/$name/"
+          Copy-Item build/runtime-licenses "dist/$name/" -Recurse
           @"
           Garlic Windows x64 portable build
           Repository: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY
@@ -81,7 +108,7 @@ jobs:
           Source base: 700a7f4ea650f5ba5162604987f5a414a2e27026
           Build run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
           Configuration: Release, MinGW-w64 GCC, static executable runtime
-          Verification: help, Java class and multithreaded JAR decompilation on Windows
+          Verification: help, Java class, multithreaded JAR decompilation, Rosemary DLL loading on Windows
           Usage: .\garlic.exe app.apk -o output
           "@ | Set-Content "dist/$name/BUILDINFO.txt"
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
