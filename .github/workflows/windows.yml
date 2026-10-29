@@ -1,0 +1,99 @@
+name: Windows portable build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/windows-build-20261029]
+    paths:
+      - '.github/workflows/windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Build optimized portable executable
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DPLATFORM_NAME=win64 \
+            '-DCMAKE_EXE_LINKER_FLAGS=-static -static-libgcc'
+          cmake --build build --parallel 2
+          strip build/garlic.exe
+          objdump -p build/garlic.exe | grep 'DLL Name:'
+          objdump -p libs/win64/librosemarylib.dll | grep 'DLL Name:'
+
+      - name: Verify on Windows without the compiler runtime in PATH
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -notmatch '(?i)msys|mingw' }) -join ';'
+          New-Item -ItemType Directory smoke -Force | Out-Null
+          'public class Hello { public static int add(int a, int b) { return a + b; } }' | Set-Content smoke/Hello.java
+          javac --release 8 smoke/Hello.java
+          if ($LASTEXITCODE -ne 0) { throw 'javac failed' }
+          & ./build/garlic.exe -h
+          if ($LASTEXITCODE -ne 0) { throw 'Help failed' }
+          $decompiled = & ./build/garlic.exe smoke/Hello.class
+          if ($LASTEXITCODE -ne 0) { throw 'Class decompilation failed' }
+          $decompiled | Set-Content smoke/Hello.decompiled.java
+          if (($decompiled -join "`n") -notmatch 'class Hello' -or ($decompiled -join "`n") -notmatch 'int add') {
+            throw 'Expected decompiled class and method missing'
+          }
+          jar --create --file smoke/hello.jar -C smoke Hello.class
+          if ($LASTEXITCODE -ne 0) { throw 'jar failed' }
+          & ./build/garlic.exe smoke/hello.jar -o smoke/decompiled -t 2
+          if ($LASTEXITCODE -ne 0) { throw 'JAR decompilation failed' }
+          $result = Get-ChildItem smoke/decompiled -Recurse -Filter Hello.java
+          if (!$result -or (Get-Content $result[0].FullName -Raw) -notmatch 'int add') {
+            throw 'JAR output missing expected method'
+          }
+
+      - name: Package portable ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $short = (git rev-parse --short=7 HEAD).Trim()
+          $source = (git rev-parse HEAD).Trim()
+          $name = "garlic-windows-x64-$short"
+          New-Item -ItemType Directory "dist/$name" -Force | Out-Null
+          Copy-Item build/garlic.exe, LICENSE, README.md, README.CN.md "dist/$name/"
+          Copy-Item docs/garlic-on-windows.md "dist/$name/"
+          @"
+          Garlic Windows x64 portable build
+          Repository: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY
+          Build commit: $source
+          Source base: 700a7f4ea650f5ba5162604987f5a414a2e27026
+          Build run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
+          Configuration: Release, MinGW-w64 GCC, static executable runtime
+          Verification: help, Java class and multithreaded JAR decompilation on Windows
+          Usage: .\garlic.exe app.apk -o output
+          "@ | Set-Content "dist/$name/BUILDINFO.txt"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Set-Content "dist/$name.zip.sha256" -Encoding ascii
+          "### Windows x64 portable build`n`nSHA256: ``$hash``" >> $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: garlic-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
